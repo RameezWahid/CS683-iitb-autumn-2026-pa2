@@ -1,0 +1,61 @@
+#include "cache.h"
+
+#define maxRRPV 3
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 if the line holds instructions
+
+// own stats (fills and hits split by instruction vs data)
+uint64_t l2_instr_fill = 0, l2_data_fill = 0, l2_instr_hit = 0, l2_data_hit = 0;
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+        }
+}
+
+// EVICTION: among lines at maxRRPV, evict a data line first.
+// Evict an instruction line only if every max-RRPV line is an instruction line.
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    while (1) {
+        int instr_candidate = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!l2_is_instr[set][i]) return i;      // data line: evict it
+                if (instr_candidate < 0) instr_candidate = i;
+            }
+        }
+        if (instr_candidate >= 0) return instr_candidate; // only instr lines at max
+        for (int i = 0; i < L2C_WAY; i++) l2_rrpv[set][i]++;  // age everything
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip) assert(0);
+
+    if (hit) {
+        // PROMOTION: instruction lines go straight to 0; data lines move one step closer
+        if (isInstruction) l2_is_instr[set][way] = 1;     // line stays marked once it is instr
+        if (l2_is_instr[set][way]) l2_rrpv[set][way] = 0;
+        else if (l2_rrpv[set][way] > 0) l2_rrpv[set][way]--;
+        if (isInstruction) l2_instr_hit++; else l2_data_hit++;
+    } else {
+        // INSERTION: instruction lines at 0 (kept longest), data lines at maxRRPV-1 as in SRRIP
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+        l2_rrpv[set][way] = isInstruction ? 0 : maxRRPV - 1;
+        if (isInstruction) l2_instr_fill++; else l2_data_fill++;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "IRRIP instr_fills " << l2_instr_fill << " data_fills " << l2_data_fill
+         << " instr_hits " << l2_instr_hit << " data_hits " << l2_data_hit << endl;
+}
