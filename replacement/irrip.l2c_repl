@@ -4,9 +4,6 @@
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 if the line holds instructions
 
-// stats: L2 load misses after warmup, split by instruction vs data
-uint64_t l2_instr_load_miss = 0, l2_data_load_miss = 0;
-
 void CACHE::l2c_initialize_replacement()
 {
     cout << "Initialize I-RRIP state for L2C" << endl;
@@ -40,11 +37,6 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 {
     if ((type == WRITEBACK) && ip) assert(0);
 
-    // STATS: a call with hit == 0 is the fill of a miss; count demand loads only, after warmup
-    if (!hit && type == LOAD && warmup_complete[cpu]) {
-        if (isInstruction) l2_instr_load_miss++; else l2_data_load_miss++;
-    }
-
     if (hit) {
         // PROMOTION: instruction lines go straight to 0; data lines move one step closer
         if (isInstruction) l2_is_instr[set][way] = 1;     // line stays marked once it is instr
@@ -57,8 +49,8 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     }
 }
 
+// use this function to print out your own stats at the end of simulation
 void CACHE::l2c_replacement_final_stats()
 {
-    cout << "L2C_SPLIT instr_load_miss " << l2_instr_load_miss
-         << " data_load_miss " << l2_data_load_miss << endl;
+
 }
