@@ -1,16 +1,75 @@
 #include "cache.h"
 
+#include <cstdint>
+
+#define IP_TABLE_SETS 256
+#define PT_SETS 1024
+#define PAGE_SHIFT 12
+
+//Table to trackstride pattern 
+struct Pattern_Entry{
+    uint16_t signature_tag;//stores 12 bit signature
+    int8_t predicted_stride;
+    uint8_t confidence_pattern;
+    uint8_t valid;
+}pattern_table[PT_SETS];
+
+//Table Entry for tracking IP
+struct IP_Entry{
+    uint64_t tag;
+    uint64_t last_address;
+    int8_t last_stride;
+    uint8_t confidence_uniform; 
+    uint16_t signature; // to fit 12bit signature 16 bit is neededs
+    uint8_t valid;
+}ip_table[IP_TABLE_SETS];
+
+uint64_t total_prefetches=0, useful_hits=0;
+uint32_t prefetch_degree =2; //inititalised to 2
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    for (int i = 0; i < IP_TABLE_SETS; i++) {
+        ip_table[i].valid = 0;
+        ip_table[i].tag = 0;
+        ip_table[i].last_address = 0;
+        ip_table[i].last_stride = 0;
+        ip_table[i].confidence_uniform = 0;
+        ip_table[i].signature = 0;
+    }
+    for (int i = 0; i < PT_SETS; i++) {
+        pattern_table[i].valid = 0;
+        pattern_table[i].signature_tag = 0;
+        pattern_table[i].predicted_stride = 0;
+        pattern_table[i].confidence_pattern = 0;
+    }
+    total_prefetches = 0;
+    useful_hits = 0;
+    prefetch_degree = 2;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    uint64_t page_curr = addr >> PAGE_SHIFT;
+    uint32_t ip_index = (ip ^ (ip >> 8)) % IP_TABLE_SETS; 
+    uint64_t ip_tag = ip >> 8;
+    IP_Entry *ip_entry = &ip_table[ip_index];
+
+    //check if the ip is a miss or tag is missmatched, then allocate a new Entry
+    if(! ip_entry->valid || ip_entry-> != ip_tag){
+        ip_entry->valid = 1;
+        ip_entry->tag = ip_tag;
+        ip_entry->last_address = addr;
+        ip_entry->last_stride = 0;
+        ip_entry->confidence_uniform= 0;
+        ip_entry->signature = 0;
+        return;
+    }
+    
+    int
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
