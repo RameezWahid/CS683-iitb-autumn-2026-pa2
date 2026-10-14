@@ -3,6 +3,9 @@
 #define maxRRPV 3
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 
+// stats: L2 load misses after warmup, split by instruction vs data
+uint64_t l2_instr_load_miss = 0, l2_data_load_miss = 0;
+
 // initialize replacement state
 void CACHE::l2c_initialize_replacement()
 {
@@ -47,11 +50,11 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     else if (type == WRITEBACK)
         TYPE_NAME = "WB";
     else if (type == LOAD_TRANSLATION)
-	TYPE_NAME = "L_TN";
+        TYPE_NAME = "L_TN";
     else if (type == PREFETCH_TRANSLATION)
-	TYPE_NAME = "P_TN";
+        TYPE_NAME = "P_TN";
     else if (type == TRANSLATION_FROM_L1D)
-	TYPE_NAME = "TN_L1D";
+        TYPE_NAME = "TN_L1D";
     else
         assert(0);
 
@@ -63,10 +66,11 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     if ((type == WRITEBACK) && ip)
         assert(0);
 
-    // uncomment this line to see the L2C accesses
-    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
-    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
-    
+    // STATS: a call with hit == 0 is the fill of a miss; count demand loads only, after warmup
+    if (!hit && type == LOAD && warmup_complete[cpu]) {
+        if (isInstruction) l2_instr_load_miss++; else l2_data_load_miss++;
+    }
+
     if (hit)
         l2_rrpv[set][way] = 0;
     else
@@ -76,5 +80,6 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 // use this function to print out your own stats at the end of simulation
 void CACHE::l2c_replacement_final_stats()
 {
-
+    cout << "L2C_SPLIT instr_load_miss " << l2_instr_load_miss
+         << " data_load_miss " << l2_data_load_miss << endl;
 }
