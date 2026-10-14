@@ -1,0 +1,50 @@
+Task 3 design exploration (SPP at L1D + Dynamic I-RRIP at L2C, 25M warmup + 25M sim, threshold 0.05)
+
+Built from dyn_irrip_exploration.l2c_repl (same policy as the final file, with every option behind an
+X_* environment variable). Logs in logs/<variant>_trace<N>.txt.
+
+Legend
+  dyn(nopf) Dynamic I-RRIP without any prefetcher (Task 2B run)
+  spp_lru  standalone SPP, LRU L2C
+  spp_dyn  SPP + Task 2B Dynamic I-RRIP, no prefetch awareness
+  vA  prefetch fill RRPV 3, prefetch hit: no promotion
+  vB  prefetch fill RRPV 2, prefetch hit: no promotion
+  vC  prefetch fill RRPV 3, prefetch hit: normal promotion
+  vD  adaptive: RRPV 2 if >=25% of the last 1024 L2 prefetch fills got a demand hit in the L2, else RRPV 3
+  vE  prefetch fill RRPV 0, prefetch hit: no promotion
+  vF  prefetch fill RRPV 1, prefetch hit: no promotion
+  vG  prefetch fill RRPV 2, no promotion, unused prefetched lines at RRPV 3 evicted first
+  vH  prefetch fill RRPV 1, prefetch hit: normal promotion           <== final design
+  vH2 vH re-run with a rebuilt binary (determinism check, identical)
+  vI  as vF, but leader sets ignore prefetches (plain SRRIP insertion for them)
+  vJ  as vH, and in instruction mode unused prefetched lines are never chosen while other data exists
+  vK  prefetch fill RRPV 0, prefetch hit: normal promotion
+  vL  as vH, but RRPV 3 whenever the L1D prefetch accuracy of the last 1024 L2 prefetch fills is < 40%
+  vM  as vH, and writeback fills inserted at RRPV 3 (not a prefetch idea; checked for completeness)
+  vN  as vH with threshold 0.10
+
+Columns: speedup over LRU without prefetching (L2C load MPKI | instruction | data) per trace, geomean speedup
+dyn(nopf)      1.0101(19.04|i9.07|d9.97)  1.0349(21.38|i9.26|d12.11)  1.0057(3.99|i0.73|d3.27)  GM 1.0168
+spp_dyn        1.0222(17.87|i9.04|d8.83)  1.0430(21.04|i9.30|d11.74)  1.0229(3.31|i0.72|d2.58)  GM 1.0293
+spp_lru        1.0087(16.83|i10.39|d6.43)  1.0065(27.49|i19.13|d8.35)  1.0160(3.31|i1.14|d2.17)  GM 1.0104
+vA             1.0196(17.91|i9.08|d8.83)  1.0429(21.03|i9.30|d11.74)  1.0225(3.31|i0.73|d2.58)  GM 1.0283
+vB             1.0219(17.88|i9.05|d8.83)  1.0430(21.03|i9.29|d11.74)  1.0229(3.31|i0.72|d2.58)  GM 1.0292
+vC             1.0198(17.89|i9.06|d8.83)  1.0430(21.03|i9.29|d11.74)  1.0226(3.31|i0.72|d2.58)  GM 1.0284
+vD             1.0199(17.91|i9.08|d8.83)  1.0429(21.03|i9.30|d11.74)  1.0226(3.31|i0.73|d2.59)  GM 1.0284
+vE             1.0227(17.89|i9.05|d8.83)  1.0444(20.83|i9.09|d11.74)  1.0229(3.31|i0.72|d2.58)  GM 1.0299
+vF             1.0220(17.88|i9.05|d8.83)  1.0443(20.84|i9.10|d11.74)  1.0232(3.31|i0.72|d2.59)  GM 1.0298
+vG             1.0218(17.88|i9.05|d8.83)  1.0428(21.03|i9.29|d11.74)  1.0228(3.31|i0.72|d2.58)  GM 1.0291
+vH             1.0226(17.88|i9.04|d8.83)  1.0445(20.84|i9.10|d11.75)  1.0232(3.31|i0.72|d2.58)  GM 1.0301
+vH2            1.0226(17.88|i9.04|d8.83)  1.0445(20.84|i9.10|d11.75)  1.0232(3.31|i0.72|d2.58)  GM 1.0301
+vI             1.0218(17.88|i9.05|d8.83)  1.0444(20.83|i9.09|d11.74)  1.0232(3.31|i0.72|d2.59)  GM 1.0297
+vJ             1.0132(18.09|i9.40|d8.68)  1.0402(21.30|i9.46|d11.84)  1.0173(3.48|i0.91|d2.57)  GM 1.0235
+vK             1.0226(17.89|i9.05|d8.83)  1.0442(20.85|i9.11|d11.74)  1.0231(3.31|i0.72|d2.58)  GM 1.0299
+vL             1.0225(17.88|i9.05|d8.83)  1.0443(20.81|i9.06|d11.74)  1.0228(3.31|i0.73|d2.58)  GM 1.0298
+vM             1.0202(17.89|i9.05|d8.84)  1.0429(20.76|i9.02|d11.73)  1.0228(3.31|i0.72|d2.59)  GM 1.0286
+vN             1.0226(17.88|i9.04|d8.83)  1.0441(20.84|i9.10|d11.75)  1.0227(3.32|i0.73|d2.58)  GM 1.0297
+
+Note: in the exploration build the "useful" field of the L2C_PF line (and ChampSim's own L2C
+"USEFUL" prefetch count) double-counts, because the exploration code incremented a global named
+pf_useful, which is shadowed by the CACHE member of the same name. Only statistics are affected,
+not the policy (the final file uses pf_used and reports the correct value, e.g. 981 instead of
+1962 for vH on trace1).

@@ -1,0 +1,232 @@
+#include "cache.h"
+#include <cstdlib>
+#include "ooo_cpu.h"
+
+// EXPLORATION BUILD of prefetch-aware Dynamic I-RRIP (Task 3); knobs via env X_*
+
+#define maxRRPV 3
+#define NUM_LEADER_SETS 16
+#define LEADER_STRIDE (L2C_SET / NUM_LEADER_SETS)
+#define DEFAULT_THRESHOLD 0.05
+#define DEFAULT_EPOCH_LEN 512
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];
+uint8_t  l2_is_pf[L2C_SET][L2C_WAY];
+
+uint64_t ld_instr_access = 0, ld_instr_miss = 0;
+uint64_t ld_total_access = 0, ld_total_miss = 0;
+uint64_t ld_epoch_access = 0;
+
+double   irrip_threshold = DEFAULT_THRESHOLD;
+uint64_t epoch_len = DEFAULT_EPOCH_LEN;
+uint8_t  irrip_mode = 0;
+double   last_ratio = 0.0;
+
+uint64_t l2_instr_load_miss = 0, l2_data_load_miss = 0;
+uint64_t epochs_irrip = 0, epochs_srrip = 0, mode_switches = 0;
+
+// prefetch knobs
+int x_protect = 0, x_wb_ins = 2;
+uint64_t l1_useful_prev = 0, l1_issued_prev = 0;
+int x_aware = 1, x_pf_ins = 3, x_pf_hit = 0, x_pf_dpromo = 0, x_adapt = 0, x_evict = 0, x_leader_pf = 1;
+double x_acc = 0.25;
+uint64_t x_pf_epoch = 1024;
+
+uint64_t pf_fill_ep = 0, pf_useful_ep = 0;
+uint8_t  pf_good = 0;
+uint64_t pf_fills = 0, pf_useful = 0, pf_evict_unused = 0, pf_hit_reqs = 0;
+uint64_t pf_epochs_good = 0, pf_epochs_total = 0;
+
+static inline bool is_leader_set(uint32_t set)
+{
+    return (set % LEADER_STRIDE) == ((set / LEADER_STRIDE) % LEADER_STRIDE);
+}
+
+static inline bool is_demand(uint32_t type)
+{
+    return type != WRITEBACK && type != PREFETCH;
+}
+
+static void end_epoch(uint32_t cpu)
+{
+    uint64_t denom = ld_total_access + ld_total_miss;
+    if (denom) {
+        last_ratio = (double)(ld_instr_access + ld_instr_miss) / denom;
+        uint8_t new_mode = (last_ratio > irrip_threshold) ? 1 : 0;
+        if (new_mode != irrip_mode && warmup_complete[cpu]) mode_switches++;
+        irrip_mode = new_mode;
+    }
+    if (warmup_complete[cpu]) {
+        if (irrip_mode) epochs_irrip++; else epochs_srrip++;
+    }
+    ld_instr_access >>= 1; ld_instr_miss >>= 1;
+    ld_total_access >>= 1; ld_total_miss >>= 1;
+    ld_epoch_access = 0;
+}
+
+static int envi(const char *n, int d) { const char *v = getenv(n); return v ? atoi(v) : d; }
+
+void CACHE::l2c_initialize_replacement()
+{
+    const char *t = getenv("DYN_IRRIP_THRESHOLD");
+    if (t) irrip_threshold = atof(t);
+    const char *e = getenv("DYN_IRRIP_EPOCH");
+    if (e && atoll(e) > 0) epoch_len = atoll(e);
+    x_aware = envi("X_AWARE", 1);
+    x_pf_ins = envi("X_PF_INS", 3);
+    x_pf_hit = envi("X_PF_HIT", 0);
+    x_pf_dpromo = envi("X_PF_DPROMO", 0);
+    x_adapt = envi("X_ADAPT", 0);
+    x_evict = envi("X_EVICT", 0);
+    x_leader_pf = envi("X_LEADER_PF", 1);
+    x_pf_epoch = envi("X_PF_EPOCH", 1024);
+    x_protect = envi("X_PROTECT", 0);
+    x_wb_ins = envi("X_WB_INS", 2);
+    const char *a = getenv("X_ACC"); if (a) x_acc = atof(a);
+    pf_good = 1;
+
+    cout << "Initialize X Dynamic I-RRIP aware=" << x_aware << " ins=" << x_pf_ins << " hit=" << x_pf_hit
+         << " dpromo=" << x_pf_dpromo << " adapt=" << x_adapt << " acc=" << x_acc << " evict=" << x_evict
+         << " leaderpf=" << x_leader_pf << " thr=" << irrip_threshold << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = 0;
+            l2_is_pf[i][j] = 0;
+        }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool leader = is_leader_set(set);
+    bool aware = x_aware && (!leader || x_leader_pf);
+
+    if (aware && x_evict) {
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_is_pf[set][i] && l2_rrpv[set][i] == maxRRPV) return i;
+    }
+
+    if (!leader && irrip_mode) {
+        bool has_data = false;
+        for (int i = 0; i < L2C_WAY; i++)
+            if (!l2_is_instr[set][i] && !(x_protect && l2_is_pf[set][i])) has_data = true;
+        if (has_data) {
+            while (1) {
+                for (int i = 0; i < L2C_WAY; i++)
+                    if (!l2_is_instr[set][i] && !(x_protect && l2_is_pf[set][i]) && l2_rrpv[set][i] == maxRRPV) return i;
+                for (int i = 0; i < L2C_WAY; i++)
+                    if (l2_rrpv[set][i] < maxRRPV) l2_rrpv[set][i]++;
+            }
+        }
+    }
+
+    while (1) {
+        for (int i = 0; i < L2C_WAY; i++)
+            if (l2_rrpv[set][i] == maxRRPV) return i;
+        for (int i = 0; i < L2C_WAY; i++) l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip) assert(0);
+
+    if (!hit && type == LOAD && warmup_complete[cpu]) {
+        if (isInstruction) l2_instr_load_miss++; else l2_data_load_miss++;
+    }
+
+    bool leader = is_leader_set(set);
+    bool aware = x_aware && (!leader || x_leader_pf);
+
+    if (leader && is_demand(type)) {
+        ld_total_access++;
+        if (isInstruction) ld_instr_access++;
+        if (!hit) {
+            ld_total_miss++;
+            if (isInstruction) ld_instr_miss++;
+        }
+        if (++ld_epoch_access >= epoch_len) end_epoch(cpu);
+    }
+
+    // prefetch usefulness bookkeeping (all sets)
+    bool first_use = false;
+    if (hit) {
+        if (type == PREFETCH) {
+            if (warmup_complete[cpu]) pf_hit_reqs++;
+        } else if (is_demand(type) && l2_is_pf[set][way]) {
+            first_use = true;
+            l2_is_pf[set][way] = 0;
+            pf_useful_ep++;
+            if (warmup_complete[cpu]) pf_useful++;
+        }
+    } else {
+        if (l2_is_pf[set][way] && warmup_complete[cpu]) pf_evict_unused++;
+        l2_is_pf[set][way] = (type == PREFETCH) ? 1 : 0;
+        if (type == PREFETCH) {
+            if (warmup_complete[cpu]) pf_fills++;
+            if (++pf_fill_ep >= x_pf_epoch) {
+                if (x_adapt == 2) {
+                    CACHE &l1 = ooo_cpu[cpu].L1D;
+                    uint64_t du = l1.pf_useful >= l1_useful_prev ? l1.pf_useful - l1_useful_prev : l1.pf_useful;
+                    uint64_t di = l1.pf_lower_level >= l1_issued_prev ? l1.pf_lower_level - l1_issued_prev : l1.pf_lower_level;
+                    l1_useful_prev = l1.pf_useful; l1_issued_prev = l1.pf_lower_level;
+                    pf_good = di ? ((double)du / di) >= x_acc : 1;
+                } else
+                pf_good = ((double)pf_useful_ep / pf_fill_ep) >= x_acc;
+                if (warmup_complete[cpu]) { pf_epochs_total++; if (pf_good) pf_epochs_good++; }
+                pf_fill_ep = 0; pf_useful_ep = 0;
+            }
+        }
+    }
+
+    if (hit) {
+        if (isInstruction) l2_is_instr[set][way] = 1;
+    } else {
+        l2_is_instr[set][way] = isInstruction ? 1 : 0;
+    }
+
+    if (aware) {
+        if (hit && type == PREFETCH && !x_pf_hit) return;          // prefetch hit: keep RRPV
+        if (!hit && type == PREFETCH) {                            // prefetch fill
+            int ins = x_pf_ins;
+            if (x_adapt == 1) ins = pf_good ? maxRRPV - 1 : maxRRPV;
+            if (x_adapt == 2) ins = pf_good ? x_pf_ins : maxRRPV;
+            l2_rrpv[set][way] = ins;
+            return;
+        }
+        if (first_use && x_pf_dpromo) { l2_rrpv[set][way] = x_pf_dpromo; return; }
+    }
+
+    if (!hit && type == WRITEBACK) { l2_rrpv[set][way] = x_wb_ins; return; }
+    if (leader || !irrip_mode) {
+        l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
+        return;
+    }
+
+    if (hit) {
+        if (l2_is_instr[set][way]) l2_rrpv[set][way] = 0;
+        else if (l2_rrpv[set][way] > 0) l2_rrpv[set][way]--;
+    } else {
+        l2_rrpv[set][way] = isInstruction ? 0 : maxRRPV - 1;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "L2C_SPLIT instr_load_miss " << l2_instr_load_miss
+         << " data_load_miss " << l2_data_load_miss << endl;
+    uint64_t epochs = epochs_irrip + epochs_srrip;
+    cout << "DYN_IRRIP threshold " << irrip_threshold
+         << " epochs " << epochs
+         << " irrip_epochs " << epochs_irrip
+         << " srrip_epochs " << epochs_srrip
+         << " irrip_fraction " << (epochs ? (double)epochs_irrip / epochs : 0.0)
+         << " mode_switches " << mode_switches
+         << " last_ratio " << last_ratio << endl;
+    cout << "L2C_PF fills " << pf_fills << " useful " << pf_useful << " evicted_unused " << pf_evict_unused
+         << " pf_hits " << pf_hit_reqs << " good_epochs " << pf_epochs_good << " / " << pf_epochs_total << endl;
+}
