@@ -1,3 +1,6 @@
+// NOTE (Task 2A): update_replacement_state now takes an extra isInstruction
+// argument (1 = instruction fetch). This policy ignores it; the parameter exists
+// only so that all replacement policies share one function-pointer signature.
 #include "cache.h"
 
 #define maxRRPV 3

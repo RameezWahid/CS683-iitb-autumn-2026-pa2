@@ -1,56 +1,89 @@
+/*
+ * irrip.l2c_repl -- Instruction-aware RRIP for the L2 cache
+ *
+ * Same basic idea as SRRIP, but instructions get more protection than data.
+ *
+ *   instruction fill -> RRPV 0
+ *   data fill        -> RRPV 2
+ *   instruction hit  -> RRPV 0
+ *   data hit         -> RRPV - 1
+ *
+ * When several lines are equally old, evict data before instructions.
+ *
+ * find_victim() does not know the type of the line, so keep one bit per
+ * line to remember whether it is an instruction line.
+ */
 #include "cache.h"
 
 #define maxRRPV 3
+
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 if the line holds instructions
+uint8_t  l2_is_instr[L2C_SET][L2C_WAY];    // 1 = instruction, 0 = data
 
 void CACHE::l2c_initialize_replacement()
 {
     cout << "Initialize I-RRIP state for L2C" << endl;
+
     for (int i = 0; i < L2C_SET; i++)
         for (int j = 0; j < L2C_WAY; j++) {
+            // Empty ways should win the first victim search.
             l2_rrpv[i][j] = maxRRPV;
             l2_is_instr[i][j] = 0;
         }
 }
 
-// EVICTION: among lines at maxRRPV, evict a data line first.
-// Evict an instruction line only if every max-RRPV line is an instruction line.
+// Among equally old lines, throw out data first.
+// Prefer a data line when there is a choice at max RRPV.
+// If only instruction lines have reached max RRPV, evict one of them.
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
     while (1) {
         int instr_candidate = -1;
+
         for (int i = 0; i < L2C_WAY; i++) {
             if (l2_rrpv[set][i] == maxRRPV) {
-                if (!l2_is_instr[set][i]) return i;      // data line: evict it
-                if (instr_candidate < 0) instr_candidate = i;
+                if (!l2_is_instr[set][i])
+                    return i;              // Data is the cheaper thing to lose (Prefer a data line).
+
+                if (instr_candidate < 0)
+                    instr_candidate = i;
             }
         }
-        if (instr_candidate >= 0) return instr_candidate; // only instr lines at max
-        for (int i = 0; i < L2C_WAY; i++) l2_rrpv[set][i]++; // Increase the RRPV of every way in this set
+
+        if (instr_candidate >= 0)
+            return instr_candidate;          // No data candidate was available.
+
+        // Nobody is old enough yet. No line has reached max RRPV yet, so age the set.
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
     }
-    assert(0);
-    return 0;
 }
 
 void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
 {
-    if ((type == WRITEBACK) && ip) assert(0);
+    if ((type == WRITEBACK) && ip)
+        assert(0);
 
     if (hit) {
-        // PROMOTION: instruction lines go straight to 0; data lines move one step closer
-        if (isInstruction) l2_is_instr[set][way] = 1;     // line stays marked once it is instr
-        if (l2_is_instr[set][way]) l2_rrpv[set][way] = 0;
-        else if (l2_rrpv[set][way] > 0) l2_rrpv[set][way]--;
+        // Instruction references get full protection.
+        // Keep the bit until this line is replaced.
+        if (isInstruction)
+            l2_is_instr[set][way] = 1;
+
+        if (l2_is_instr[set][way])
+            l2_rrpv[set][way] = 0;
+        else if (l2_rrpv[set][way] > 0)
+            l2_rrpv[set][way]--;
     } else {
-        // INSERTION: instruction lines at 0 (kept longest), data lines at maxRRPV-1 as in SRRIP
+        // A new line replaces whatever was here before.
         l2_is_instr[set][way] = isInstruction ? 1 : 0;
+
+        // Keep instruction lines longer, use normal SRRIP insertion
+        // for data lines.
         l2_rrpv[set][way] = isInstruction ? 0 : maxRRPV - 1;
     }
 }
 
-// use this function to print out your own stats at the end of simulation
 void CACHE::l2c_replacement_final_stats()
 {
-
 }
