@@ -1,9 +1,0 @@
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-lru-lru-lru-lru-lru-1core-baseline /traces/Trace1.gz results/baseline_Trace1.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-lru-lru-lru-lru-lru-1core-baseline /traces/Trace2.gz results/baseline_Trace2.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-lru-lru-lru-lru-lru-1core-baseline /traces/Trace3.gz results/baseline_Trace3.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-rrip-lru-lru-lru-lru-1core-rrip /traces/Trace1.gz results/rrip_Trace1.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-rrip-lru-lru-lru-lru-1core-rrip /traces/Trace2.gz results/rrip_Trace2.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-rrip-lru-lru-lru-lru-1core-rrip /traces/Trace3.gz results/rrip_Trace3.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-irrip-lru-lru-lru-lru-1core-irrip /traces/Trace1.gz results/irrip_Trace1.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-irrip-lru-lru-lru-lru-1core-irrip /traces/Trace2.gz results/irrip_Trace2.txt
-bin/hashed_perceptron-no-no-no-no-no-no-no-lru-lru-lru-irrip-lru-lru-lru-lru-1core-irrip /traces/Trace3.gz results/irrip_Trace3.txt
