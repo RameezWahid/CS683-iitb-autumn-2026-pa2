@@ -2,7 +2,7 @@
 #include <cstdlib>
 
 /*
- * Dynamic I-RRIP (Task 2B) for the L2C
+ * Dynamic I-RRIP (Task 2B) with prefetch awareness (Task 3) for the L2C
  *
  * I-RRIP (Task 2A) favours instruction lines: they are inserted and promoted
  * to RRPV 0, and the victim search skips them while a data line at maxRRPV
@@ -45,9 +45,42 @@
  *   the metric is an exponentially decaying average: old phases fade out and
  *   the policy can switch when the program changes behaviour.
  *
+ * Prefetch awareness (Task 3):
+ *   With SPP at the L1D, the L2 also receives PREFETCH requests. Such a
+ *   request fills the L2 on a miss (and, with FILL_L1, the L1D as well).
+ *   Prefetch packets are handled differently from demand packets in three places:
+ *   1. Sampling: prefetches are never counted in the leader-set ratio. They
+ *      are speculative, always data, and their volume depends on how
+ *      aggressive SPP currently is, not on what the core waits for.
+ *      Counting them would lower r whenever SPP is aggressive and turn
+ *      instruction priority off for the wrong reason.
+ *   2. Insertion: a prefetch fill is inserted at RRPV PF_INSERT_RRPV (1), in
+ *      every set and in both modes. That is one step safer than a demand
+ *      data fill (2) and one step below code in instruction mode (0).
+ *      SPP's prefetches are about to be demanded (L1D accuracy 38-53% on our
+ *      traces). A prefetched line that the L1D drops early, or that SPP
+ *      re-requests, then still hits in the L2 instead of going to the LLC.
+ *      Measured alternatives (task3/report, results/task3/sensitivity and
+ *      results/task3/design_exploration):
+ *        RRPV 3 (dead-on-arrival)                  -0.17% geomean
+ *        RRPV 2 (same as demand data)              -0.08%
+ *        RRPV 0                                    -0.02%
+ *        never evict an unused prefetch while
+ *        other data exists                         -0.64%
+ *      So prefetched lines need a little protection, but not much: the
+ *      L1D usually holds its own copy.
+ *   3. Promotion: a prefetch request that hits in the L2 is promoted like a
+ *      demand hit of a data line, because SPP is predicting a demand access.
+ *      Leaving the RRPV unchanged was measured to be slightly worse.
+ *   Every packet type other than PREFETCH is handled exactly as in Task 2B,
+ *   so without a prefetcher this policy behaves identically to Task 2B.
+ *
  * Knobs (sensitivity study without recompiling):
  *   DYN_IRRIP_THRESHOLD  environment variable, e.g. 0.05 (default below)
  *   DYN_IRRIP_EPOCH      environment variable, leader accesses per epoch
+ *   DYN_IRRIP_PF_INS     environment variable, RRPV given to prefetch fills (0-3)
+ *   DYN_IRRIP_PF_AWARE   environment variable, 0 = treat prefetches like any
+ *                        data packet (the plain Task 2B policy), for comparison
  *   e.g.  DYN_IRRIP_THRESHOLD=0.20 ./bin/<binary> -warmup_instructions ...
  */
 
@@ -61,9 +94,11 @@
 #define LEADER_STRIDE (L2C_SET / NUM_LEADER_SETS)
 #define DEFAULT_THRESHOLD 0.05
 #define DEFAULT_EPOCH_LEN 512
+#define PF_INSERT_RRPV 1
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 uint8_t  l2_is_instr[L2C_SET][L2C_WAY];   // 1 if the line holds instructions
+uint8_t  l2_is_pf[L2C_SET][L2C_WAY];      // statistics only: 1 if the line was brought in by a prefetch and not yet demanded
 
 // leader-set counters (decayed by half every epoch)
 uint64_t ld_instr_access = 0, ld_instr_miss = 0;
@@ -74,11 +109,16 @@ double   irrip_threshold = DEFAULT_THRESHOLD;
 uint64_t epoch_len = DEFAULT_EPOCH_LEN;
 uint8_t  irrip_mode = 0;                   // 1 => followers run instruction mode, 0 => SRRIP
 double   last_ratio = 0.0;
+uint8_t  pf_aware = 1;                     // 0 => prefetch packets handled as plain data (Task 2B)
+uint32_t pf_insert_rrpv = PF_INSERT_RRPV;
 
 // stats: L2 load misses after warmup, split by instruction vs data
 uint64_t l2_instr_load_miss = 0, l2_data_load_miss = 0;
 // stats: how often each mode was picked after warmup, and how often it flipped
 uint64_t epochs_irrip = 0, epochs_srrip = 0, mode_switches = 0;
+// stats: prefetch fills, prefetched lines later hit by a demand access, prefetched
+// lines evicted without any demand hit, and prefetch requests that hit in the L2
+uint64_t pf_fills = 0, pf_used = 0, pf_evicted_unused = 0, pf_hits = 0;
 
 // Leader sets are spread over the whole index range: in every group of
 // LEADER_STRIDE consecutive sets, pick the one whose offset equals the group
@@ -122,16 +162,23 @@ void CACHE::l2c_initialize_replacement()
     if (t) irrip_threshold = atof(t);
     const char *e = getenv("DYN_IRRIP_EPOCH");
     if (e && atoll(e) > 0) epoch_len = atoll(e);
+    const char *a = getenv("DYN_IRRIP_PF_AWARE");
+    if (a) pf_aware = atoi(a) ? 1 : 0;
+    const char *p = getenv("DYN_IRRIP_PF_INS");
+    if (p && atoi(p) >= 0 && atoi(p) <= maxRRPV) pf_insert_rrpv = atoi(p);
 
     cout << "Initialize Dynamic I-RRIP state for L2C"
          << " (leader sets: " << NUM_LEADER_SETS
          << ", threshold: " << irrip_threshold
-         << ", epoch: " << epoch_len << " leader accesses)" << endl;
+         << ", epoch: " << epoch_len << " leader accesses"
+         << ", prefetch aware: " << (int)pf_aware
+         << ", prefetch insertion RRPV: " << pf_insert_rrpv << ")" << endl;
 
     for (int i = 0; i < L2C_SET; i++)
         for (int j = 0; j < L2C_WAY; j++) {
             l2_rrpv[i][j] = maxRRPV;
             l2_is_instr[i][j] = 0;
+            l2_is_pf[i][j] = 0;
         }
 }
 
@@ -140,6 +187,8 @@ void CACHE::l2c_initialize_replacement()
 //  - followers in instruction mode: if the set holds any data line, age the set
 //    until a data line reaches maxRRPV and evict it; code is never evicted while
 //    data is present. An all-code set falls back to SRRIP.
+//  Prefetched lines are data lines here; their protection comes only from the
+//  lower insertion RRPV (shielding them from eviction cost 0.64% geomean).
 uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
     if (!is_leader_set(set) && irrip_mode) {
@@ -176,9 +225,20 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
         if (isInstruction) l2_instr_load_miss++; else l2_data_load_miss++;
     }
 
+    // STATS: life of prefetched lines in the L2 (no effect on the policy)
+    if (warmup_complete[cpu]) {
+        if (hit && type == PREFETCH) pf_hits++;
+        if (hit && is_demand(type) && l2_is_pf[set][way]) pf_used++;
+        if (!hit && l2_is_pf[set][way]) pf_evicted_unused++;   // the victim being replaced
+        if (!hit && type == PREFETCH) pf_fills++;
+    }
+    if (!hit) l2_is_pf[set][way] = (type == PREFETCH) ? 1 : 0;
+    else if (is_demand(type)) l2_is_pf[set][way] = 0;
+
     bool leader = is_leader_set(set);
 
     // SAMPLING: a hit is one access; a fill is one access that missed.
+    // is_demand() keeps prefetches out of the ratio (prefetch awareness, point 1).
     if (leader && is_demand(type)) {
         ld_total_access++;
         if (isInstruction) ld_instr_access++;
@@ -196,6 +256,14 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     } else {
         l2_is_instr[set][way] = isInstruction ? 1 : 0;
     }
+
+    // PREFETCH FILL (prefetch awareness, point 2): same insertion in leaders and
+    // followers and in both modes, so the leaders measure the system as it runs.
+    if (pf_aware && !hit && type == PREFETCH) {
+        l2_rrpv[set][way] = pf_insert_rrpv;
+        return;
+    }
+    // A prefetch hit falls through to the normal promotion below (point 3).
 
     if (leader || !irrip_mode) {
         // SRRIP: hit -> 0, insert at maxRRPV-1 (same as rrip.l2c_repl)
@@ -226,4 +294,10 @@ void CACHE::l2c_replacement_final_stats()
          << " irrip_fraction " << (epochs ? (double)epochs_irrip / epochs : 0.0)
          << " mode_switches " << mode_switches
          << " last_ratio " << last_ratio << endl;
+    cout << "L2C_PF pf_aware " << (int)pf_aware
+         << " insert_rrpv " << pf_insert_rrpv
+         << " fills " << pf_fills
+         << " demand_used " << pf_used
+         << " evicted_unused " << pf_evicted_unused
+         << " prefetch_hits " << pf_hits << endl;
 }
