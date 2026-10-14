@@ -1787,6 +1787,7 @@ int main(int argc, char** argv)
 		print_roi_stats(i, &ooo_cpu[i].BTB);
 #endif
         print_roi_stats(i, &ooo_cpu[i].L2C);
+	ooo_cpu[i].L2C.l2c_replacement_final_stats(); // single-core runs never reached the call in the NUM_CPUS > 1 block
 	 #ifdef PUSH_DTLB_PB
         print_roi_stats(i, &ooo_cpu[i].DTLB_PB);
         #endif
